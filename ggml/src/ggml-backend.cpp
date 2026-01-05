@@ -13,6 +13,14 @@
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
+#include <sys/mman.h> // Para mmap, munmap, madvise
+#include <fcntl.h>    // Para open, O_RDWR, etc.
+#include <unistd.h>   // Para close, ftruncate, unlink
+#include <cstdio>     // Para sprintf
+#include <cerrno>     // Para debug de erros
+#include <cstdlib> // Para std::getenv
+#include <cstring> // Para strcmp
+
 #include <assert.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -2198,9 +2206,140 @@ static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend_buffer_ty
     GGML_UNUSED(buft);
 }
 
-static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * data = ggml_aligned_malloc(size);
+// --- INÍCIO DA IMPLEMENTAÇÃO FLASH ---
 
+struct ggml_backend_flash_context {
+    void * addr;           // O endereço virtual (que o Llama vê)
+    size_t size;           // Tamanho total do tensor
+    int    fd;             // File Descriptor (o nosso "controle remoto" do arquivo)
+};
+
+// Função para liberar a memória (destrutor)
+static void ggml_backend_flash_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_backend_flash_context * ctx = (ggml_backend_flash_context *) buffer->context;
+    
+    // Desfaz o mapeamento da memória virtual
+    if (ctx->addr != MAP_FAILED) {
+        munmap(ctx->addr, ctx->size);
+    }
+    
+    // Fecha o arquivo (como demos unlink, o espaço em disco é liberado agora)
+    if (ctx->fd != -1) {
+        close(ctx->fd);
+    }
+    
+    delete ctx;
+    // fprintf(stderr, "[FLASH-FREE] Buffer liberado.\n"); // Opcional
+}
+
+// Função para obter o ponteiro de dados (Onde a mágica acontece)
+// O Llama vai chamar isso achando que vai receber a memória inteira.
+static void * ggml_backend_flash_get_base(ggml_backend_buffer_t buffer) {
+    ggml_backend_flash_context * ctx = (ggml_backend_flash_context *) buffer->context;
+    return ctx->addr; 
+}
+
+// Interface (VTable) - Copiamos a maioria da CPU, mas mudamos o free e get_base
+static struct ggml_backend_buffer_i ggml_backend_flash_buffer_i = {
+    /* .free_buffer     = */ ggml_backend_flash_free_buffer, // <--- NOSSA (Custom)
+    /* .get_base        = */ ggml_backend_flash_get_base,    // <--- NOSSA (Custom)
+    
+    // As linhas abaixo usam as funções da CPU JÁ EXISTENTES no arquivo.
+    /* .init_tensor     = */ NULL,
+    /* .memset_tensor   = */ ggml_backend_cpu_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_cpu_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cpu_buffer_get_tensor,
+    /* .cpy_tensor      = */ ggml_backend_cpu_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_cpu_buffer_clear,
+    /* .reset           = */ NULL, 
+};
+
+// --- FIM DA IMPLEMENTAÇÃO FLASH ---
+
+static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    // Limite de 600MB para pegar apenas pesos do modelo, ignorando KV Cache
+    const size_t THRESHOLD_HUGE = 600 * 1024 * 1024; 
+
+    // CAMINHO FLASH (Virtualização)
+    if (size > THRESHOLD_HUGE) {
+        fprintf(stderr, "\n[FLASH-ALLOC] Inicializando Backing Store para %.2f MB...\n", 
+                (double)size / (1024.0 * 1024.0));
+
+        ggml_backend_flash_context * ctx = new ggml_backend_flash_context();
+        ctx->size = size;
+
+        // --- Configuração do Arquivo ---
+        char filename[128];
+        static int tensor_count = 0;
+        sprintf(filename, "/tmp/llama_flash_tensor_%d.bin", tensor_count++);
+
+        ctx->fd = open(filename, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (ctx->fd == -1) {
+            fprintf(stderr, "[FLASH-ERROR] Falha no open: %d\n", errno);
+            delete ctx;
+            return NULL;
+        }
+
+        // UNLINK: O arquivo é deletado do diretório mas continua existindo 
+        // para o processo enquanto estiver aberto. Isso evita lixo no disco se travar.
+        unlink(filename);
+
+        // 4. Definir tamanho físico do arquivo no disco
+        if (ftruncate(ctx->fd, size) == -1) {
+            fprintf(stderr, "[FLASH-ERROR] Falha no ftruncate\n");
+            close(ctx->fd);
+            delete ctx;
+            return NULL;
+        }
+
+        // 5. MMAP: Mapear o arquivo para um endereço de memória virtual
+        // MAP_SHARED: Alterações na memória vão para o arquivo
+        ctx->addr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, ctx->fd, 0);
+
+        if (ctx->addr == MAP_FAILED) {
+            fprintf(stderr, "[FLASH-ERROR] Falha no mmap\n");
+            close(ctx->fd);
+            delete ctx;
+            return NULL;
+        }
+
+        fprintf(stderr, "[FLASH-SUCCESS] Buffer mapeado em %p (FD: %d)\n", ctx->addr, ctx->fd);
+
+        // CONTROLE DINÂMICO (Nova implementação)
+        // Aqui decidimos o comportamento baseando-se na variável de ambiente
+        const char* mode = std::getenv("LLAMA_FLASH_MODE");
+        
+        if (mode != NULL) {
+            if (std::strcmp(mode, "evict") == 0) {
+                // Modo "Teste Ácido": Força o uso do disco
+                madvise(ctx->addr, size, MADV_DONTNEED);
+                fprintf(stderr, "[FLASH-CONTROL] Modo 'evict': RAM descartada, rodando do disco.\n");
+            } 
+            else if (std::strcmp(mode, "seq") == 0) {
+                // Modo Otimizado para Carga
+                madvise(ctx->addr, size, MADV_SEQUENTIAL);
+            }
+        } else {
+            // Se não definir variável, o SO gerencia a RAM normalmente (rápido)
+            // fprintf(stderr, "[FLASH-CONTROL] Modo padrão (SO gerencia).\n");
+        }
+
+        return ggml_backend_buffer_init(buft, ggml_backend_flash_buffer_i, ctx, size);
+    }
+
+    // CAMINHO PADRÃO (Memória pequena / CPU normal)
+    if (size > THRESHOLD_HUGE) {
+        // Log específico para candidatos ao "Flash Loading"
+        fprintf(stderr, "\n[FLASH-CANDIDATE] Alloc: %.2f MB (Pode ir para o SSD)\n", 
+                (double)size / (1024.0 * 1024.0));
+    } else {
+        // Log para memória pequena (KV Cache, ativações, buffers temporários)
+        // fprintf(stderr, "[RAM] Alloc: %zu bytes\n", size); // Comentado para limpar o log
+    }
+
+    // Alocação real (Mantemos o original por enquanto)
+    void * data = ggml_aligned_malloc(size);
+    
     if (data == NULL) {
         GGML_LOG_ERROR("%s: failed to allocate buffer of size %zu\n", __func__, size);
         return NULL;
